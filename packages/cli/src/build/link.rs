@@ -681,9 +681,18 @@ impl BuildRequest {
         modified_crates: &HashSet<String>,
     ) -> Result<Vec<String>> {
         // Exclude the tip crate — it's compiled separately via cargo_build after replay.
-        // Modified crates are tracked by *package* name, which can differ from the bin
-        // target name (`tip_crate_name()`), e.g. package `browser` with `[[bin]] name = "blitz"`.
-        let tip = self.tip_package_name();
+        //
+        // The exclusion must key on the tip *binary's* rustc crate name:
+        // replay units are rustc crate names (see `file_to_workspace_crate`
+        // and the `--crate-name` keys in `workspace_rustc_args`), and a
+        // package's lib normalizes to the same string as the package itself
+        // (package `ui-kit` → lib crate `ui_kit`). Filtering by
+        // `tip_package_name()` would drop that lib from the replay whenever
+        // the served target is a *different* bin of the same package (e.g.
+        // `dx serve -p ui-kit --bin storybook`): the tip then relinks against
+        // a stale rlib and the patch applies with only the bin's own (unchanged)
+        // jump-table entries — "hot-patch applied" with no visible change.
+        let tip = self.tip_crate_name();
         let crates: HashSet<&String> = modified_crates
             .iter()
             .filter(|name| **name != tip)
