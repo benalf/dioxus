@@ -121,7 +121,7 @@ ansi-to-tui = { workspace = true }
 ansi-to-html = { workspace = true }
 path-absolutize = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
-ratatui = { workspace = true, features = ["crossterm", "unstable"] }
+ratatui = { workspace = true, features = ["crossterm", "unstable", "scrolling-regions"] }
 shell-words = { workspace = true }
 
 # disable `log` entirely since `walrus` uses it and is *much* slower with it enableda
