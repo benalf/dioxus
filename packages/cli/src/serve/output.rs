@@ -1,7 +1,7 @@
 use crate::Result;
 use crate::{
     BuildId, BuildStage, BuilderUpdate, BundleFormat, TraceContent, TraceMsg, TraceSrc,
-    serve::{ServeUpdate, WebServer, ansi_buffer::ansi_string_to_line},
+    serve::{ServeUpdate, WebServer},
 };
 use anyhow::{Context, anyhow, bail};
 use cargo_metadata::diagnostic::Diagnostic;
@@ -17,7 +17,7 @@ use crossterm::{
 use ratatui::{
     TerminalOptions, Viewport,
     prelude::*,
-    widgets::{Block, BorderType, Borders, LineGauge, Paragraph},
+    widgets::{Block, BorderType, Borders, LineGauge, Paragraph, Wrap},
 };
 use std::{
     cell::RefCell,
@@ -888,25 +888,25 @@ impl Output {
     /// close to real as possible. Once the log is printed, it is lost, so we need to be very careful
     /// here to not print it incorrectly.
     ///
-    /// This method works by printing lines at the top of the viewport frame, and then scrolling up
-    /// the viewport accordingly, such that our final call to "clear"  will cause the terminal the viewport
-    /// to be comlpetely erased and rewritten. This is slower since we're going around ratatui's diff
-    /// logic, but it's the only way to do this that gives us "true println!" semantics.
+    /// We hand the rendered lines to `Terminal::insert_before`, which owns the full responsibility
+    /// of making room for them - either by pushing the viewport further down the screen, or by
+    /// scrolling the screen above it upwards once the viewport is pinned to the bottom. This keeps
+    /// ratatui's own bookkeeping of where the viewport lives in sync with what's physically on the
+    /// terminal.
     ///
-    /// In the future, Ratatui's insert_before method will get scroll regions, which will make this logic
-    /// much simpler. In that future, we'll simply insert a line into the scrollregion which should automatically
-    /// force that portion of the terminal to scroll up.
-    ///
-    /// TODO(jon): we could look into implementing scroll regions ourselves, but I think insert_before will
-    /// land in a reasonable amount of time.
-    #[deny(clippy::manual_saturating_arithmetic)]
-    fn render_log(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-        log: TraceMsg,
-    ) -> Result<()> {
-        use unicode_segmentation::UnicodeSegmentation;
-
+    /// Previously this method computed the scroll amount by hand and then wrote the log text
+    /// directly via raw crossterm cursor movements, bypassing `insert_before`'s own scrolling (it
+    /// was called with a no-op draw callback purely to borrow its screen-scrolling side effect).
+    /// Those two mechanisms didn't agree on how far the screen had moved, so ratatui's next `draw`
+    /// call would diff against a buffer that no longer matched reality - rows would be redrawn
+    /// blank one at a time instead of new text appearing, and old lines wouldn't scroll up as a
+    /// unit. Rendering straight into the buffer that `insert_before` hands us avoids the desync
+    /// entirely.
+    fn render_log<B>(&mut self, terminal: &mut Terminal<B>, log: TraceMsg) -> Result<()>
+    where
+        B: ratatui::backend::Backend,
+        B::Error: std::error::Error + Send + Sync + 'static,
+    {
         // Only show debug logs if verbose is enabled
         if log.level == Level::DEBUG && !self.verbose {
             return Ok(());
@@ -916,82 +916,29 @@ impl Output {
             return Ok(());
         }
 
-        // Grab out the size and location of the terminal and its viewport before we start messing with it
-        let frame_rect = terminal.get_frame().area();
-        let term_size = terminal.size().unwrap();
-
-        // Render the log into an ansi string
-        // We're going to add some metadata to it like the timestamp and source and then dump it to the raw ansi sequences we need to send to crossterm
-        let lines = Self::tracemsg_to_ansi_string(log);
-
-        // Get the lines of the output sequence and their overflow
-        let lines_printed = lines
-            .iter()
-            .map(|line| {
-                // Very important to strip ansi codes before counting graphemes - the ansi codes count as multiple graphemes!
-                let grapheme_count = console::strip_ansi_codes(line).graphemes(true).count();
-                grapheme_count.max(1).div_ceil(term_size.width as usize) as u16
-            })
-            .sum::<u16>();
-
-        // The viewport might be clipped, but the math still needs to work out.
-        let actual_vh_height = self.viewport_current_height().min(term_size.height);
-
-        // Move the terminal's cursor down to the number of lines printed
-        let remaining_space = term_size
-            .height
-            .saturating_sub(frame_rect.y + frame_rect.height);
-
-        // Calculate how many lines we need to push back
-        // - padding equals lines_printed when the frame is at the bottom
-        // - padding is zero when the remaining space is greater/equal than the scrollback (the frame will get pushed naturally)
-        // Determine what extra padding is remaining after we've shifted the terminal down
-        // this will be the distance between the final line and the top of the frame, only if the
-        // final line has extended into the frame
-        let final_line = frame_rect.y + lines_printed;
-        let max_frame_top = term_size.height - actual_vh_height;
-        let padding = final_line
-            .saturating_sub(max_frame_top)
-            .clamp(0, actual_vh_height - 1);
-
-        // The only reliable way we can force the terminal downards is through "insert_before".
-        //
-        // If we need to push the terminal down, we'll use this method with the number of lines
-        // Ratatui will handle this rest.
-        //
-        // This also calls `.clear()` so we don't need to call clear at the end of this function.
-        //
-        // FIXME(jon): eventually insert_before will get scroll regions, breaking this, but making the logic here simpler
-        terminal.insert_before(remaining_space.min(lines_printed), |_| {})?;
-
-        // Wipe the viewport clean so it doesn't tear
-        crossterm::queue!(
-            std::io::stdout(),
-            crossterm::cursor::MoveTo(0, frame_rect.y),
-            crossterm::terminal::Clear(ClearType::FromCursorDown),
-        )?;
-
-        // Start printing the log by writing on top of the topmost line
-        for (idx, line) in lines.into_iter().enumerate() {
-            // Move the cursor to the correct line offset but don't go past the bottom of the terminal
-            let start = frame_rect.y + idx as u16;
-            let start = start.min(term_size.height - 1);
-            crossterm::queue!(
-                std::io::stdout(),
-                crossterm::cursor::MoveTo(0, start),
-                crossterm::style::Print(line),
-                crossterm::style::Print("\n"),
-            )?;
+        // Render the log into styled lines, with metadata like the timestamp and source attached.
+        let lines = Self::tracemsg_to_lines(log);
+        if lines.is_empty() {
+            return Ok(());
         }
 
-        // Scroll the terminal if we need to
-        for _ in 0..padding {
-            crossterm::queue!(
-                std::io::stdout(),
-                crossterm::cursor::MoveTo(0, term_size.height - 1),
-                crossterm::style::Print("\n"),
-            )?;
-        }
+        // Use ratatui's own cached viewport width here, not `terminal.size()`. `size()` queries
+        // the backend live and can be ahead of what `insert_before` actually uses internally
+        // (`self.viewport_area`, only resynced by `autoresize()` inside `Terminal::draw`). If a
+        // resize lands in between two `draw()` calls, computing our height against the live width
+        // while `insert_before` renders into a buffer sized by the stale cached width makes the
+        // two disagree on how many rows the paragraph needs - so it draws over however many rows
+        // we guessed, which can land on top of the gauges below. `get_frame().area()` reads the
+        // same `viewport_area` that `insert_before` renders into, so the two always agree.
+        let width = terminal.get_frame().area().width;
+        let paragraph = Paragraph::new(Text::from(lines)).wrap(Wrap { trim: false });
+        let height = (paragraph.line_count(width) as u16).max(1);
+
+        // Let ratatui render straight into the space it inserts, instead of guessing where that
+        // space landed and writing to it ourselves afterwards.
+        terminal.insert_before(height, |buf| {
+            paragraph.render(buf.area, buf);
+        })?;
 
         Ok(())
     }
@@ -1003,7 +950,7 @@ impl Output {
         }
     }
 
-    fn tracemsg_to_ansi_string(log: TraceMsg) -> Vec<String> {
+    fn tracemsg_to_lines(log: TraceMsg) -> Vec<Line<'static>> {
         use ansi_to_tui::IntoText;
         use chrono::Timelike;
 
@@ -1075,7 +1022,7 @@ impl Output {
                     line = line.dark_gray();
                 }
 
-                lines.push(ansi_string_to_line(line));
+                lines.push(line);
             }
         }
 
@@ -1130,5 +1077,136 @@ impl std::ops::Drop for Output {
 
         // Tear down the TUI if it's active at this point.
         _ = crate::serve::Output::remote_shutdown(self.interactive);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+
+    /// Builds an `Output` without touching the real terminal, so `render_log` can be exercised
+    /// against a `TestBackend` instead of `CrosstermBackend<io::Stdout>`.
+    fn test_output() -> Output {
+        Output {
+            interactive: true,
+            term: Rc::new(RefCell::new(None)),
+            dx_version: "test".into(),
+            events: None,
+            more_modal_open: false,
+            pending_logs: VecDeque::new(),
+            throbber: RefCell::new(throbber_widgets_tui::ThrobberState::default()),
+            trace: false,
+            verbose: false,
+            tick_animation: false,
+            tick_interval: {
+                let mut interval = tokio::time::interval(Duration::from_millis(TICK_RATE_MS));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                interval
+            },
+        }
+    }
+
+    fn log(text: &str) -> TraceMsg {
+        TraceMsg::text(TraceSrc::Dev, Level::INFO, text.to_string())
+    }
+
+    /// Renders the "gauges" area, standing in for the real `render_frame` call in `render()`.
+    /// What matters for this test is only that *something* occupies the viewport so we can check
+    /// it survives log rendering untouched.
+    fn draw_viewport<B: ratatui::backend::Backend>(terminal: &mut Terminal<B>) {
+        terminal
+            .draw(|f| f.render_widget(Paragraph::new("VIEWPORT MARKER"), f.area()))
+            .unwrap();
+    }
+
+    /// Flattens a `TestBackend`'s buffer into one string per row, for easy substring assertions.
+    fn rows_of(backend: &TestBackend) -> Vec<String> {
+        let buffer = backend.buffer();
+        let area = buffer.area;
+        (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// Reproduces the reported bug: pin the inline viewport at the bottom of a small terminal
+    /// (the steady state for `dx serve`, where there's no space below the gauges), then push
+    /// several distinct log lines one at a time the same way `render()` drains `pending_logs`.
+    ///
+    /// Before the fix, `render_log` called `insert_before` with a no-op draw closure purely to
+    /// borrow its scrolling side effect, then wrote the actual text separately via raw crossterm
+    /// cursor math that didn't agree with where `insert_before` had actually moved the viewport.
+    /// That desync is what produced the reported symptom: rows going blank instead of showing the
+    /// new line, and old lines not scrolling up as a unit. Rendering happens entirely through
+    /// `insert_before`'s own buffer now, so there's nothing left to desync.
+    #[tokio::test]
+    async fn log_lines_scroll_without_blanking() {
+        let backend = TestBackend::new(30, 6);
+        let mut terminal = Terminal::with_options(
+            backend,
+            TerminalOptions {
+                viewport: Viewport::Inline(3),
+            },
+        )
+        .unwrap();
+
+        // Establish the viewport, then push it down to the very bottom of the screen by
+        // inserting filler lines - matching `dx serve`'s steady state where there's no slack
+        // below the gauges and new lines must scroll the screen itself.
+        draw_viewport(&mut terminal);
+        terminal.insert_before(3, |_| {}).unwrap();
+        draw_viewport(&mut terminal);
+
+        let mut output = test_output();
+
+        for i in 0..6 {
+            output
+                .render_log(&mut terminal, log(&format!("log line {i}")))
+                .unwrap();
+            draw_viewport(&mut terminal);
+        }
+
+        let rows = rows_of(terminal.backend());
+        let screen = rows.join("\n");
+
+        // The most recent lines must be visible and intact - not blanked out.
+        assert!(
+            screen.contains("log line 5"),
+            "newest log line missing from screen:\n{screen}"
+        );
+        assert!(
+            screen.contains("log line 4"),
+            "previous log line missing from screen (should still be visible pre-scroll-off):\n{screen}"
+        );
+
+        // The viewport itself must still be intact and present exactly once - not overwritten by
+        // a desynced log print, and not duplicated by a desynced scroll.
+        let marker_rows = rows
+            .iter()
+            .filter(|r| r.contains("VIEWPORT MARKER"))
+            .count();
+        assert_eq!(
+            marker_rows, 1,
+            "expected exactly one intact viewport row, got {marker_rows}:\n{screen}"
+        );
+
+        // No row should be entirely blank in between two rows that have content - a blank gap
+        // surrounded by content is exactly the "line turned blank" symptom.
+        let first_content = rows.iter().position(|r| !r.is_empty());
+        let last_content = rows.iter().rposition(|r| !r.is_empty());
+        if let (Some(first), Some(last)) = (first_content, last_content) {
+            for (idx, row) in rows.iter().enumerate().take(last + 1).skip(first) {
+                assert!(
+                    !row.is_empty(),
+                    "row {idx} went blank between content rows {first} and {last}:\n{screen}"
+                );
+            }
+        }
     }
 }

@@ -5,7 +5,6 @@ use crate::{
     styles::{GLOW_STYLE, LINK_STYLE},
 };
 
-mod ansi_buffer;
 mod output;
 mod proxy;
 mod proxy_ws;
